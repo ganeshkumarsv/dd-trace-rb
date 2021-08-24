@@ -71,12 +71,15 @@ RSpec.describe Datadog::Context do
     let(:span) { new_span }
 
     def new_span
-      instance_double(
-        Datadog::Span,
-        name: double('name'),
-        trace_id: double('trace ID'),
-        span_id: double('span ID'),
-        sampled: double('sampled')
+      Datadog::SpanOperation.new(
+        instance_double(Datadog::Tracer),
+        instance_double(Datadog::Context),
+        Datadog::Span.new(
+          double('name'),
+          trace_id: double('trace ID'),
+          span_id: double('span ID'),
+          sampled: double('sampled')
+        )
       ).tap do |span|
         allow(span).to receive(:context=)
       end
@@ -168,11 +171,8 @@ RSpec.describe Datadog::Context do
         span_id: double('span ID'),
         parent: double('parent ID'),
         sampled: double('sampled'),
-        tracer: instance_double(Datadog::Tracer),
         finished?: false
-      ).tap do |span|
-        allow(span).to receive(:context=)
-      end
+      )
     end
 
     before { context.add_span(span) }
@@ -308,19 +308,26 @@ RSpec.describe Datadog::Context do
     it { is_expected.to be nil }
 
     context 'after a span is added' do
-      let(:span) { Datadog::Span.new(tracer, 'span.one', context: context) }
+      let(:span) do
+        Datadog::SpanOperation.new(
+          tracer,
+          context,
+          Datadog::Span.new('span.one')
+        )
+      end
 
       before { context.add_span(span) }
 
       it { is_expected.to be span }
 
       context 'which is a child to another span' do
-        let(:parent_span) { Datadog::Span.new(tracer, 'span.parent') }
+        let(:parent_span) { Datadog::Span.new('span.parent') }
+
         let(:span) do
-          Datadog::Span.new(
+          Datadog::SpanOperation.new(
             tracer,
-            'span.child',
-            context: context
+            context,
+            Datadog::Span.new('span.child')
           ).tap { |s| s.parent = parent_span }
         end
 
@@ -334,7 +341,13 @@ RSpec.describe Datadog::Context do
       end
 
       context 'followed by a second span' do
-        let(:span_two) { Datadog::Span.new(tracer, 'span.two', context: context) }
+        let(:span_two) do
+          Datadog::SpanOperation.new(
+            tracer,
+            context,
+            Datadog::Span.new('span.two')
+          )
+        end
 
         before { context.add_span(span_two) }
 
@@ -367,27 +380,36 @@ RSpec.describe Datadog::Context do
   describe '#delete_span_if' do
     subject(:annotate_for_flush!) { context.delete_span_if(&block) }
 
-    let(:remaining_span) { Datadog::Span.new(tracer, 'remaining', context: context).tap(&:finish) }
-    let(:deleted_span) { Datadog::Span.new(tracer, 'deleted', context: context).tap(&:finish) }
-    let(:block) { proc { |s| s == deleted_span } }
+    context 'when the Context contains spans' do
+      let(:remaining_span_op) { Datadog::SpanOperation.build(tracer, context, 'remaining').tap(&:finish) }
+      let(:remaining_span) { remaining_span_op.span }
+      let(:deleted_span_op) { Datadog::SpanOperation.build(tracer, context, 'deleted').tap(&:finish) }
+      let(:deleted_span) { deleted_span_op.span }
 
-    before do
-      context.add_span(remaining_span)
-      context.add_span(deleted_span)
-    end
+      let(:block) { proc { |s| s == deleted_span } }
 
-    it 'returns deleted spans' do
-      is_expected.to contain_exactly(deleted_span)
-    end
+      before do
+        context.add_span(remaining_span_op)
+        context.add_span(deleted_span_op)
+      end
 
-    it 'keeps spans not deleted' do
-      expect { subject }.to change { context.finished_span_count }.from(2).to(1)
+      it 'returns deleted spans' do
+        is_expected.to contain_exactly(deleted_span)
+      end
 
-      expect(context.get[0]).to contain_exactly(remaining_span)
-    end
+      it 'keeps spans not deleted' do
+        expect { subject }.to change { context.finished_span_count }.from(2).to(1)
 
-    it 'detaches context from delete span' do
-      expect { subject }.to change { deleted_span.context }.from(context).to(nil)
+        expect(context.get[0]).to contain_exactly(remaining_span)
+      end
+
+      it 'detaches context from delete span' do
+        expect { subject }.to change { deleted_span.context }.from(context).to(nil)
+      end
+
+      it 'decrements the finished span count' do
+        expect { subject }.to change { context.finished_span_count }.from(2).to(1)
+      end
     end
   end
 
@@ -501,77 +523,9 @@ RSpec.describe Datadog::Context do
     end
   end
 
-  describe '#length' do
-    subject(:ctx) { context }
-
-    let(:span) { new_span }
-
-    def new_span(name = nil)
-      Datadog::Span.new(tracer, name)
-    end
-
-    context 'with many spans' do
-      it 'tracks the number of spans added to the trace' do
-        10.times do |i|
-          span_to_add = span
-          expect(ctx.send(:length)).to eq(i)
-          ctx.add_span(span_to_add)
-          expect(ctx.send(:length)).to eq(i + 1)
-          ctx.close_span(span_to_add)
-          expect(ctx.send(:length)).to eq(i + 1)
-        end
-
-        ctx.get
-        expect(ctx.send(:length)).to eq(0)
-      end
-    end
-  end
-
-  describe '#start_time' do
-    subject(:ctx) { tracer.call_context }
-
-    context 'with no active spans' do
-      it 'does not have a start time' do
-        expect(ctx.send(:start_time)).to be nil
-      end
-    end
-
-    context 'with a span in the trace' do
-      it 'tracks start time of the span when trace is active' do
-        expect(ctx.send(:start_time)).to be nil
-
-        tracer.trace('test.op') do |span|
-          expect(ctx.send(:start_time)).to eq(span.start_time)
-          expect(ctx.send(:start_time)).to_not be nil
-        end
-
-        expect(ctx.send(:start_time)).to be nil
-      end
-    end
-  end
-
-  describe '#each_span' do
-    subject(:ctx) { context }
-
-    def new_span(name = nil)
-      Datadog::Span.new(tracer, name)
-    end
-
-    context 'with a span in the trace' do
-      it 'iterates over all the spans available' do
-        test_name = 'op.test'
-        new_span(test_name)
-
-        ctx.send(:each_span) do |span|
-          expect(span.name).to eq(test_name)
-        end
-      end
-    end
-  end
-
   describe 'thread safe behavior' do
     def new_span(name = nil)
-      Datadog::Span.new(tracer, name)
+      Datadog::Span.new(name)
     end
 
     context 'with many threads' do
